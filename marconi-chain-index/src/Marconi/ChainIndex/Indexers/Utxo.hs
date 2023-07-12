@@ -14,6 +14,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- + This module will create the SQL tables:
 --
@@ -76,7 +77,7 @@ import Data.Aeson (
   (.=),
  )
 import Data.Either (fromRight, rights)
-import Data.Foldable (toList)
+import Data.Foldable (toList, traverse_)
 import Data.List (sortOn)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map)
@@ -204,8 +205,16 @@ isInInterval slotNoInterval slotNo =
 type UtxoIndexer = Storable.State UtxoHandle
 
 data UtxoHandle = UtxoHandle
-  { hdlConnection :: !SQL.Connection
-  -- ^ SQLite connection
+  { hdlUTXOConnection :: !SQL.Connection
+  -- ^ SQLite connection for utxos
+  , hdlSpentConnection :: !SQL.Connection
+  -- ^ SQLite connection for spent
+  , hdlDatumConnection :: !SQL.Connection
+  -- ^ SQLite connection for datum
+  , hdlChainPointConnection :: !SQL.Connection
+  -- ^ SQLite connection for chainPoint
+  , hdlQueryConnection :: !SQL.Connection
+  -- ^ SQLite connection for queries
   , hdlDepth :: !Int
   -- ^ depth before flushing to disk storage
   , toVacuume :: !Bool
@@ -659,13 +668,19 @@ open
   -- ^ whether to perform vacuum
   -> StorableMonad UtxoHandle UtxoIndexer
 open dbPath (Depth k) isToVacuume = do
-  c <- liftSQLError CantStartIndexer (SQL.open dbPath)
+  let dbFiles@[utxoDb, spentDb, datumDb, chainPointDb] =
+        mappend dbPath
+          <$> ["-utxo.db", "-spent.db", "-datum.db", "-chainpoint.db"]
+  conns@[cUtxo, cSpent, cDatum, cChainPoint] <-
+    traverse
+      (liftSQLError CantStartIndexer . SQL.open)
+      dbFiles
 
-  lift $ SQL.execute_ c "PRAGMA journal_mode=WAL"
+  lift $ traverse_ (flip SQL.execute_ "PRAGMA journal_mode=WAL") conns
 
   lift $
     SQL.execute_
-      c
+      cUtxo
       [sql|CREATE TABLE IF NOT EXISTS unspent_transactions
                     ( address TEXT NOT NULL
                     , txId TEXT NOT NULL
@@ -684,7 +699,7 @@ open dbPath (Depth k) isToVacuume = do
 
   lift $
     SQL.execute_
-      c
+      cSpent
       [sql|CREATE TABLE IF NOT EXISTS spent
                     ( txId TEXT NOT NULL
                     , txIx INT NOT NULL
@@ -698,26 +713,32 @@ open dbPath (Depth k) isToVacuume = do
 
   lift $
     SQL.execute_
-      c
+      cDatum
       [sql|CREATE TABLE IF NOT EXISTS datumhash_datum ( datum_hash BLOB PRIMARY KEY , datum BLOB)|]
 
-  lift $ createLastSyncTable c
+  lift $ createLastSyncTable cChainPoint
 
-  lift $ SQL.execute_ c [sql|CREATE INDEX IF NOT EXISTS spent_slotNo ON spent (slotNo)|]
+  lift $ SQL.execute_ cSpent [sql|CREATE INDEX IF NOT EXISTS spent_slotNo ON spent (slotNo)|]
 
-  lift $ SQL.execute_ c [sql|CREATE INDEX IF NOT EXISTS spent_txId ON spent (txId, txIx)|]
+  lift $ SQL.execute_ cSpent [sql|CREATE INDEX IF NOT EXISTS spent_txId ON spent (txId, txIx)|]
 
   lift $
     SQL.execute_
-      c
+      cSpent
       [sql|CREATE INDEX IF NOT EXISTS spent_tx_inputs ON spent (spentTxId)|]
 
   lift $
     SQL.execute_
-      c
+      cUtxo
       [sql|CREATE INDEX IF NOT EXISTS unspent_transaction_address ON unspent_transactions (address)|]
 
-  emptyState k (UtxoHandle c k isToVacuume)
+  cQuery <- liftSQLError CantStartIndexer $ SQL.open ":memory:"
+  lift $ SQL.execute cQuery "ATTACH DATABASE ? AS utxo" $ SQL.Only utxoDb
+  lift $ SQL.execute cQuery "ATTACH DATABASE ? AS spent" $ SQL.Only spentDb
+  lift $ SQL.execute cQuery "ATTACH DATABASE ? AS datum" $ SQL.Only datumDb
+  lift $ SQL.execute cQuery "ATTACH DATABASE ? AS chainpoint" $ SQL.Only chainPointDb
+
+  emptyState k (UtxoHandle cUtxo cSpent cDatum cChainPoint cQuery k isToVacuume)
 
 getSpentFrom :: StorableEvent UtxoHandle -> [Spent]
 getSpentFrom (UtxoEvent _ txIns bi _) = do
@@ -734,7 +755,7 @@ instance Buffered UtxoHandle where
     -> UtxoHandle -- Handler for storing events
     -> StorableMonad UtxoHandle UtxoHandle
   persistToStorage events h | null events = pure h
-  persistToStorage events h@(UtxoHandle c _k toVacuume) =
+  persistToStorage events h =
     liftSQLError CantInsertEvent $ do
       let rows = concatMap eventToRows events
           spents = concatMap getSpentFrom events
@@ -743,67 +764,68 @@ instance Buffered UtxoHandle where
             (C.ChainPoint <$> view blockInfoSlotNo <*> view blockInfoBlockHeaderHash)
               . ueBlockInfo
               <$> toList events
-      bracket_
-        (SQL.execute_ c "BEGIN")
-        (SQL.execute_ c "COMMIT")
-        ( SQL.executeMany
-            c
-            [sql|INSERT
-             INTO unspent_transactions (
-               address,
-               txId,
-               txIx,
-               datumHash,
-               value,
-               inlineScript,
-               inlineScriptHash,
-               txIndexInBlock,
-               slotNo,
-               blockHeaderHash,
-               blockNo,
-               blockTimestamp,
-               epochNo
-            ) VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)|]
-            rows
-            `concurrently_` SQL.executeMany
-              c
-              [sql|INSERT
-            INTO spent (
-              txId,
-              txIx, slotNo, blockHeaderHash, blockNo, blockTimestamp, epochNo, spentTxId
-            ) VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?)|]
-              spents
-            `concurrently_` SQL.executeMany
-              c
-              [sql|INSERT OR IGNORE INTO datumhash_datum
-                   ( datum_hash
-                   , datum
-                   )
-                   VALUES (?, ?)|]
-              datumRows
-            `concurrently_` addLastSyncPoints c chainPoints
-        )
+          cUtxo = hdlUTXOConnection h
+          cSpent = hdlSpentConnection h
+          cDatum = hdlDatumConnection h
+          cChainPoint = hdlChainPointConnection h
+          within c = bracket_ (SQL.execute_ c "BEGIN") (SQL.execute_ c "COMMIT")
+
+      within cUtxo $
+        within cSpent $
+          within cDatum $
+            within cChainPoint $
+              SQL.executeMany
+                cUtxo
+                [sql|INSERT
+           INTO unspent_transactions (
+             address,
+             txId,
+             txIx,
+             datumHash,
+             value,
+             inlineScript,
+             inlineScriptHash,
+             txIndexInBlock,
+             slotNo,
+             blockHeaderHash,
+             blockNo,
+             blockTimestamp,
+             epochNo
+          ) VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)|]
+                rows
+                `concurrently_` SQL.executeMany
+                  cSpent
+                  [sql|INSERT INTO spent (
+            txId,
+            txIx, slotNo, blockHeaderHash, blockNo, blockTimestamp, epochNo, spentTxId
+          ) VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?)|]
+                  spents
+                `concurrently_` SQL.executeMany
+                  cDatum
+                  [sql|INSERT OR IGNORE INTO datumhash_datum
+             ( datum_hash
+             , datum
+             )
+             VALUES (?, ?)|]
+                  datumRows
+                `concurrently_` addLastSyncPoints cChainPoint chainPoints
       -- We want to perform vacuum about once every 100
-      when toVacuume $ do
+      when (toVacuume h) $ do
         rndCheck <- createSystemRandom >>= uniformR (1 :: Int, 100)
         when (rndCheck == 42) $ do
           SQL.execute_
-            c
-            [sql|DELETE FROM
-                            unspent_transactions
-                          WHERE
-                            unspent_transactions.rowid IN (
-                              SELECT
-                                unspent_transactions.rowid
-                              FROM
-                                unspent_transactions
-                                JOIN spent ON unspent_transactions.txId = spent.txId
-                                AND unspent_transactions.txIx = spent.txIx
-                            )|]
+            cUtxo
+            [sql|DELETE FROM unspent_transactions
+                 WHERE unspent_transactions.rowid IN (
+                 SELECT unspent_transactions.rowid
+                 FROM unspent_transactions
+                 JOIN spent ON unspent_transactions.txId = spent.txId
+                 AND unspent_transactions.txIx = spent.txIx
+                 )|]
           -- remove Spent and release space, see https://www.sqlite.org/lang_vacuum.html
-          SQL.execute_ c "VACUUM"
+          SQL.execute_ cUtxo "VACUUM"
       pure h
 
   getStoredEvents :: UtxoHandle -> StorableMonad UtxoHandle [StorableEvent UtxoHandle]
@@ -846,10 +868,10 @@ sqliteUtxoByAddressQuery c (filters, params) order = SQL.queryNamed c query para
               GROUP_CONCAT(HEX(s2.txId)),
               GROUP_CONCAT(s2.txIx)
 
-      FROM unspent_transactions u
-      LEFT JOIN spent s           ON u.txId = s.txId AND u.txIx = s.txIx
-      LEFT JOIN spent s2          ON u.txId = s2.spentTxId
-      LEFT JOIN datumhash_datum d ON u.datumHash = d.datum_hash
+      FROM utxo.unspent_transactions u
+      LEFT JOIN spent.spent s           ON u.txId = s.txId AND u.txIx = s.txIx
+      LEFT JOIN spent.spent s2          ON u.txId = s2.spentTxId
+      LEFT JOIN datum.datumhash_datum d ON u.datumHash = d.datum_hash
            |]
         <> wherePart
         <> " GROUP BY u.txId, u.txIx"
@@ -972,9 +994,9 @@ instance Queryable UtxoHandle where
     -> UtxoHandle
     -> StorableQuery UtxoHandle
     -> StorableMonad UtxoHandle (StorableResult UtxoHandle)
-  queryStorage memoryEvents (UtxoHandle c _ _) (QueryUtxoByAddressWrapper (QueryUtxoByAddress addr slotInterval)) =
+  queryStorage memoryEvents h (QueryUtxoByAddressWrapper (QueryUtxoByAddress addr slotInterval)) =
     liftSQLError CantQueryIndexer $ do
-      persistedUtxoResults <- sqliteUtxoByAddressQuery c filters $ Just "ORDER BY u.slotNo ASC"
+      persistedUtxoResults <- sqliteUtxoByAddressQuery (hdlQueryConnection h) filters $ Just "ORDER BY u.slotNo ASC"
       bufferedUtxoResults <- concat <$> mapM bufferEventUtxoResult bufferEvents
       pure $ UtxoByAddressResult $ mapMaybe filterAddSpent persistedUtxoResults <> bufferedUtxoResults
     where
@@ -1055,16 +1077,17 @@ instance Queryable UtxoHandle where
           findDatum hash = do
             listToMaybe
               <$> SQL.query
-                c
+                (hdlDatumConnection h)
                 "SELECT datum_hash, datum FROM datumhash_datum WHERE datum_hash = ?"
                 (SQL.Only hash)
-  queryStorage es (UtxoHandle c _ _) LastSyncedBlockInfoQuery =
+  queryStorage es h LastSyncedBlockInfoQuery =
     let queryLastSlot =
           [sql|SELECT u.slotNo, u.blockHeaderHash, u.blockNo, u.blockTimestamp, u.epochNo
              FROM unspent_transactions u
              GROUP BY u.slotNo
              ORDER BY u.slotNo DESC
              LIMIT ?|]
+        cChainPoint = hdlChainPointConnection h
      in -- We don't send the last event but the one before, to ensure that every indexers reached this point
         -- It's a hack, which should be removed once we have a proper handling of synchronization events.
         --
@@ -1078,7 +1101,7 @@ instance Queryable UtxoHandle where
                 _other -> Origin
           -- 1 element in memory
           [_] -> liftSQLError CantQueryIndexer $ do
-            persisted <- SQL.query c queryLastSlot (SQL.Only (1 :: Word64))
+            persisted <- SQL.query cChainPoint queryLastSlot (SQL.Only (1 :: Word64))
             pure $
               LastSyncedBlockInfoResult $
                 case persisted of
@@ -1086,7 +1109,7 @@ instance Queryable UtxoHandle where
                   _other -> Origin
           -- 0 element in memory
           [] -> liftSQLError CantQueryIndexer $ do
-            persisted <- SQL.query c queryLastSlot (SQL.Only (2 :: Word64))
+            persisted <- SQL.query cChainPoint queryLastSlot (SQL.Only (2 :: Word64))
             pure $
               LastSyncedBlockInfoResult $
                 case persisted of
@@ -1095,21 +1118,21 @@ instance Queryable UtxoHandle where
 
 instance Rewindable UtxoHandle where
   rewindStorage :: C.ChainPoint -> UtxoHandle -> StorableMonad UtxoHandle UtxoHandle
-  rewindStorage cp@(C.ChainPoint sn _) h@(UtxoHandle c _ _) = liftSQLError CantRollback $ do
-    SQL.execute c "DELETE FROM unspent_transactions WHERE slotNo > ?" (SQL.Only sn)
-    SQL.execute c "DELETE FROM spent WHERE slotNo > ?" (SQL.Only sn)
-    rollbackLastSyncPoints c cp
+  rewindStorage cp@(C.ChainPoint sn _) h = liftSQLError CantRollback $ do
+    SQL.execute (hdlUTXOConnection h) "DELETE FROM unspent_transactions WHERE slotNo > ?" (SQL.Only sn)
+    SQL.execute (hdlSpentConnection h) "DELETE FROM spent WHERE slotNo > ?" (SQL.Only sn)
+    rollbackLastSyncPoints (hdlChainPointConnection h) cp
     pure h
-  rewindStorage C.ChainPointAtGenesis h@(UtxoHandle c _ _) = liftSQLError CantRollback $ do
-    SQL.execute_ c "DELETE FROM unspent_transactions"
-    SQL.execute_ c "DELETE FROM spent"
-    rollbackLastSyncPoints c C.ChainPointAtGenesis
+  rewindStorage C.ChainPointAtGenesis h = liftSQLError CantRollback $ do
+    SQL.execute_ (hdlUTXOConnection h) "DELETE FROM unspent_transactions"
+    SQL.execute_ (hdlSpentConnection h) "DELETE FROM spent"
+    rollbackLastSyncPoints (hdlChainPointConnection h) C.ChainPointAtGenesis
     pure h
 
 -- For resuming we need to provide a list of points where we can resume from.
 instance Resumable UtxoHandle where
-  resumeFromStorage (UtxoHandle c _ _) =
-    liftSQLError CantQueryIndexer $ queryLastSyncPoint c
+  resumeFromStorage h =
+    liftSQLError CantQueryIndexer $ queryLastSyncPoint $ hdlChainPointConnection h
 
 -- | Convert from 'AddressInEra' of the 'CurrentEra' to 'AddressAny'.
 toAddr :: C.AddressInEra era -> C.AddressAny
