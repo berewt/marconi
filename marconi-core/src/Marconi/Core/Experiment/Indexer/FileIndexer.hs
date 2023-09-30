@@ -172,8 +172,7 @@ mkFileIndexer path storageCfg filenameBuilder' eventBuilder' = do
         indexer
           & fileIndexerLastSyncPoint .~ lastStablePoint'
           & fileIndexerLastStablePoint .~ lastStablePoint'
-  indexer'' <- rollback lastStablePoint' indexer'
-  pure indexer''
+  rollback lastStablePoint' indexer'
 
 toFilename :: FilePath -> FileBuilder meta event -> Timed (Point event) (Maybe event) -> FilePath
 toFilename dir indexer evt =

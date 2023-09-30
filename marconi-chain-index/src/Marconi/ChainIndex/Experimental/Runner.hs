@@ -6,7 +6,8 @@ module Marconi.ChainIndex.Experimental.Runner (
   runIndexer,
 ) where
 
-import Cardano.Api qualified as C
+import Cardano.Api.Extended qualified as C
+import Cardano.Api.Extended.Block qualified as C
 import Cardano.Api.Extended.Streaming (
   BlockEvent (BlockEvent),
   ChainSyncEvent (RollBackward, RollForward),
@@ -18,17 +19,16 @@ import Control.Concurrent qualified as Concurrent
 import Control.Concurrent.STM qualified as STM
 import Control.Exception (catch)
 import Control.Monad.Except (ExceptT, void)
-
 import Control.Monad.State.Strict (MonadState (put), State, gets)
+import Data.Foldable (traverse_)
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Marconi.ChainIndex.Experimental.Extract.WithDistance (WithDistance, chainDistance, getEvent)
+import Marconi.ChainIndex.Experimental.Extract.WithDistance (WithDistance)
 import Marconi.ChainIndex.Experimental.Extract.WithDistance qualified as Distance
 import Marconi.ChainIndex.Experimental.Indexers.Orphans qualified ()
 import Marconi.ChainIndex.Logging (chainSyncEventStreamLogging)
 import Marconi.ChainIndex.Node.Client.Retry (withNodeConnectRetry)
 import Marconi.ChainIndex.Types (
-  BlockEvent (blockInMode),
   RunIndexerConfig (RunIndexerConfig),
   SecurityParam,
  )
@@ -49,6 +49,7 @@ instance PP.Pretty RunIndexerLog where
     "The starting point for the chain-sync protocol is" PP.<+> PP.pretty lastSyncPoint
   pretty NoIntersectionFoundLog = "No intersection found"
 
+type instance Core.Point (Either C.ChainTip (WithDistance BlockEvent)) = C.ChainPoint
 type instance Core.Point BlockEvent = C.ChainPoint
 
 {- | Connect to the given socket to start a chain sync protocol and start indexing it with the
@@ -57,12 +58,11 @@ given indexer.
 If you want to start several indexers, use @runIndexers@.
 -}
 runIndexer
-  :: ( WithDistance BlockEvent ~ event
-     , Core.IsIndex (ExceptT Core.IndexerError IO) event indexer
+  :: ( Core.IsIndex (ExceptT Core.IndexerError IO) (Either C.ChainTip (WithDistance BlockEvent)) indexer
      , Core.Closeable IO indexer
      )
   => RunIndexerConfig
-  -> indexer (WithDistance BlockEvent)
+  -> indexer (Either C.ChainTip (WithDistance BlockEvent))
   -> IO ()
 runIndexer
   ( RunIndexerConfig
@@ -98,30 +98,24 @@ runIndexer
 
 stablePointComputation
   :: SecurityParam
-  -> Core.Timed C.ChainPoint (Maybe (WithDistance BlockEvent))
+  -> Core.Timed C.ChainPoint (Maybe (Either C.ChainTip (WithDistance BlockEvent)))
   -> State (Map C.BlockNo C.ChainPoint) (Maybe C.ChainPoint)
-stablePointComputation _s (Core.Timed _ Nothing) = pure Nothing
-stablePointComputation s (Core.Timed point (Just event)) =
-  if chainDistance event > fromIntegral s
-    then do
-      put mempty
-      pure $ Just point
-    else do
-      let currentBlock = getBlockNo . blockInMode . getEvent $ event
-          lastVolatileBlock = currentBlock + fromIntegral (chainDistance event) - fromIntegral s
-      (immutable, volatile) <- gets (Map.spanAntitone (< lastVolatileBlock))
-      put (Map.insert currentBlock point volatile)
-      pure $ case Map.elems immutable of
-        [] -> Nothing
-        xs -> Just $ last xs
+stablePointComputation s (Core.Timed point (Just (Left tip))) = do
+  let tipBlockNo = C.chainTipBlockNo tip
+      lastVolatileBlock = tipBlockNo - fromIntegral s
+  (immutable, volatile) <- gets (Map.spanAntitone (< lastVolatileBlock))
+  put (Map.insert tipBlockNo point volatile)
+  pure $ case Map.elems immutable of
+    [] -> Nothing
+    xs -> Just $ last xs
+stablePointComputation _s (Core.Timed _ _) = pure Nothing
 
-getBlockNo :: C.BlockInMode C.CardanoMode -> C.BlockNo
-getBlockNo (C.BlockInMode block _eraInMode) =
-  case C.getBlockHeader block of C.BlockHeader _ _ b -> b
+chainTipToTimedEvent :: C.ChainTip -> Core.Timed C.ChainPoint C.ChainTip
+chainTipToTimedEvent tip = Core.Timed (C.chainTipToChainPoint tip) tip
 
 -- | Event preprocessing, to ease the coordinator work
 mkEventStream
-  :: STM.TBQueue (Core.ProcessedInput C.ChainPoint (WithDistance BlockEvent))
+  :: STM.TBQueue (Core.ProcessedInput C.ChainPoint (Either C.ChainTip (WithDistance BlockEvent)))
   -> S.Stream (S.Of (ChainSyncEvent BlockEvent)) IO r
   -> IO r
 mkEventStream q =
@@ -135,7 +129,13 @@ mkEventStream q =
 
       processEvent
         :: ChainSyncEvent BlockEvent
-        -> Core.ProcessedInput C.ChainPoint (WithDistance BlockEvent)
-      processEvent (RollForward x ct) = Core.Index $ Just <$> blockTimed x ct
-      processEvent (RollBackward x _) = Core.Rollback x
-   in S.mapM_ $ STM.atomically . STM.writeTBQueue q . processEvent
+        -> [Core.ProcessedInput C.ChainPoint (Either C.ChainTip (WithDistance BlockEvent))]
+      processEvent (RollForward x tip) =
+        [ Core.Index $ Just . Right <$> blockTimed x tip
+        , Core.Index $ Just . Left <$> chainTipToTimedEvent tip
+        ]
+      processEvent (RollBackward x tip) =
+        [ Core.Rollback x
+        , Core.Index $ Just . Left <$> chainTipToTimedEvent tip
+        ]
+   in S.mapM_ $ STM.atomically . traverse_ (STM.writeTBQueue q) . processEvent

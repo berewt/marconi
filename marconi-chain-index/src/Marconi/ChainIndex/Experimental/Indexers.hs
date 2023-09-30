@@ -1,19 +1,28 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Marconi.ChainIndex.Experimental.Indexers where
 
-import Cardano.Api qualified as C
+import Cardano.Api.Extended qualified as C
+import Cardano.Api.Extended.Block qualified as C
+import Cardano.Api.Shelley qualified as C
 import Cardano.BM.Tracing qualified as BM
+import Codec.CBOR.Decoding qualified as CBOR
+import Codec.CBOR.Read qualified as CBOR
 import Control.Monad.Cont (MonadIO)
 import Control.Monad.Except (ExceptT, MonadError, MonadTrans (lift))
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BS.Lazy
+import Data.ByteString.Short qualified as BS.Short
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Marconi.ChainIndex.Experimental.Extract.WithDistance (WithDistance)
 import Marconi.ChainIndex.Experimental.Indexers.BlockInfo qualified as Block
+import Marconi.ChainIndex.Experimental.Indexers.ChainTip qualified as ChainTip
 import Marconi.ChainIndex.Experimental.Indexers.Coordinator (coordinatorWorker, standardCoordinator)
 import Marconi.ChainIndex.Experimental.Indexers.Datum qualified as Datum
 import Marconi.ChainIndex.Experimental.Indexers.EpochState qualified as EpochState
@@ -35,6 +44,9 @@ import Marconi.Core.Experiment qualified as Core
 import System.FilePath ((</>))
 
 data AnyTxBody = forall era. (C.IsCardanoEra era) => AnyTxBody C.BlockNo TxIndexInBlock (C.TxBody era)
+type instance Core.Point (Either C.ChainTip (WithDistance BlockEvent)) = C.ChainPoint
+type instance Core.Point BlockEvent = C.ChainPoint
+type instance Core.Point C.ChainTip = C.ChainPoint
 type instance Core.Point [AnyTxBody] = C.ChainPoint
 
 {- | Build all the indexers of marconi-chain-index
@@ -56,17 +68,18 @@ buildIndexers
       , -- Query part (should probably be wrapped in a more complex object later)
         UtxoQuery.UtxoQueryIndexer IO
       , -- Indexing part
-        Core.WithTrace IO Core.Coordinator (WithDistance BlockEvent)
+        Core.WithTrace IO Core.Coordinator (Either C.ChainTip (WithDistance BlockEvent))
       )
 buildIndexers securityParam catchupConfig utxoConfig mintEventConfig epochStateConfig logger path = do
   let mainLogger = BM.contramap (fmap (fmap $ Text.pack . show)) logger
-      txBodyCoordinatorLogger = BM.appendName "txBody" mainLogger
+      blockEventLogger = BM.appendName "blockEvent" mainLogger
+      txBodyCoordinatorLogger = BM.appendName "txBody" blockEventLogger
 
   StandardWorker blockInfoMVar blockInfoWorker <-
-    blockInfoBuilder securityParam catchupConfig mainLogger path
+    blockInfoBuilder securityParam catchupConfig blockEventLogger path
 
   Core.WorkerIndexer _epochStateMVar epochStateWorker <-
-    epochStateBuilder securityParam catchupConfig epochStateConfig mainLogger path
+    epochStateBuilder securityParam catchupConfig epochStateConfig blockEventLogger path
 
   StandardWorker utxoMVar utxoWorker <-
     utxoBuilder securityParam catchupConfig utxoConfig txBodyCoordinatorLogger path
@@ -94,17 +107,33 @@ buildIndexers securityParam catchupConfig utxoConfig mintEventConfig epochStateC
       UtxoQuery.mkUtxoSQLiteQuery $
         UtxoQuery.UtxoQueryAggregate utxoMVar spentMVar datumMVar blockInfoMVar
 
-  mainCoordinator <-
+  blockCoordinator <-
     lift $
       standardCoordinator
-        mainLogger
+        blockEventLogger
         [blockInfoWorker, epochStateWorker, coordinatorTxBodyWorkers]
+
+  Core.WorkerIndexer _chainTipMVar chainTipIndexer <- chainTipBuilder mainLogger path
+
+  mainCoordinator <- lift $ standardCoordinator mainLogger [blockCoordinator, chainTipWorker]
 
   resumePoint <- Core.lastStablePoint mainCoordinator
 
   -- TODO Create a dedicated return type for it instead of a tuple.
   -- However, we should wait until we have more stuff in the query side before we do it.
   pure (resumePoint, queryIndexer, mainCoordinator)
+
+-- | Build and start a coordinator of a bunch of workers that takes an @AnyTxBody@ as an input
+buildBlockEventCoordinator
+  :: (MonadIO m)
+  => BM.Trace IO (Core.IndexerEvent C.ChainPoint)
+  -> [Core.Worker (WithDistance BlockEvent) C.ChainPoint]
+  -> m (Core.Worker (Either C.ChainPoint (WithDistance BlockEvent)) C.ChainPoint)
+buildBlockEventCoordinator logger workers =
+  let rightToMaybe = \case
+        Left _ -> Nothing
+        Right x -> Just x
+   in Core.worker <$> coordinatorWorker "BlockEvent coordinator" logger (pure . rightToMaybe) workers
 
 -- | Build and start a coordinator of a bunch of workers that takes an @AnyTxBody@ as an input
 buildTxBodyCoordinator
@@ -156,6 +185,19 @@ utxoBuilder securityParam catchupConfig utxoConfig logger path =
           (pure . NonEmpty.nonEmpty . (>>= extractUtxos))
           (BM.appendName "utxo" logger)
    in Utxo.utxoWorker utxoWorkerConfig utxoConfig (path </> "utxo.db")
+
+-- | Configure and start the 'ChainTip' indexer
+chainTipBuilder
+  :: (MonadIO n, MonadError Core.IndexerError n, MonadIO m)
+  => BM.Trace m (Core.IndexerEvent C.ChainPoint)
+  -> FilePath
+  -> n (Core.WorkerIndexer m (Either C.ChainTip b) C.ChainTip (Core.FileIndexer C.ChainTip))
+chainTipBuilder tracer path = do
+  let chainTipPath = path </> "chainTip"
+      blockNoAsText = maybe "" (Text.pack . show . (\(C.BlockNo b) -> b) . C.chainTipBlockNo)
+
+  chainTipIndexer <- ChainTip.mkChainTipIndexer chainTipPath storageConfig fileBuilder _
+  Core.createWorker "chainTip" leftToMaybe fileIndexer
 
 -- | Configure and start the @SpentInfo@ indexer
 spentBuilder
